@@ -1,0 +1,13 @@
+{
+  "campaign_name": ["campaign_name", "campaign name", "campaign"],
+  "adset_name": ["adset_name", "adset name", "ad set", "adset"],
+  "ad_name": ["ad_name", "ad name", "ad", "creative_name", "name"],
+  "spend": ["amount spent", "amount_spent", "amount spend", "spend"],
+  "impressions": ["impressions", "impr"],
+  "clicks": ["clicks", "link_clicks", "all_clicks", "click (all)"],
+  "installs": ["installs", "app_installs", "mobile_app_install", "conversions", "results"],
+  "cpm": ["cpm (cost per 1,000 impressions)", "cpm"],
+  "ctr": ["ctr (all)", "ctr"],
+  "cti": ["cti"],
+  "cpi": ["cost per result", "cpi", "cost per install"]
+}

@@ -1,0 +1,6 @@
+.venv/
+.pycache/
+__pycache__/
+.streamlit/secrets.toml
+data/creative_assets.db
+data/media/

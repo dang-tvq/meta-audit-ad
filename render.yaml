@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: meta-ad-analyzer
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: META_AD_ANALYZER_DATA_DIR
+        value: /var/data/meta-ad-analyzer
+    disk:
+      name: meta-ad-analyzer-data
+      mountPath: /var/data
+      sizeGB: 1
