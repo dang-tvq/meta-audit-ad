@@ -8,6 +8,10 @@ Local tool to analyze Meta ads from CSV files and detect which creatives are win
 - Upload CSV with ad metrics and use auto column mapping (advanced mapping is optional/collapsed).
 - Auto-calculate `CPM`, `CTR`, `CTI`, `CPI`.
 - Match creatives using normalized ad names.
+- AI vision tagging for matched creative assets:
+  - images are analyzed directly
+  - videos are analyzed via extracted keyframes
+  - results are cached in SQLite and reused in the qualitative feature sheet
 - Detect "win driver" based on decomposition:
   - `CPI = CPM / (1000 * CTR * CTI)`
 - Show metrics table and creative previews.
@@ -84,6 +88,28 @@ export AUDIT_AD_SKILL_PATH="/path/to/your/skill.md"
 ```bash
 export AUDIT_AD_SKILL_PATH="/path/to/your/skill.md"
 ```
+
+## AI Vision Tagging
+
+Set your OpenAI API key before running the app:
+
+```bash
+export OPENAI_API_KEY="your_api_key_here"
+```
+
+Optional:
+
+```bash
+export OPENAI_VISION_MODEL="gpt-4.1-mini"
+```
+
+Then in the `Qualitative Creative Analysis` section, open `AI Vision Tagging` and run:
+- `Analyze matched creatives with AI`
+
+The app will:
+- analyze matched image assets directly with the OpenAI Responses API
+- extract keyframes from matched videos and analyze those frames
+- store the returned feature tags in `creative_assets.analysis_json`
 
 ## Render Deploy
 

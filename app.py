@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import re
 import sqlite3
@@ -23,6 +25,7 @@ METRIC_COLUMNS = ["cpm", "ctr", "cti", "cpi"]
 COLUMN_ALIASES_PATH = DATA_DIR / "column_aliases.json"
 SKILL_BUNDLE_DIR = APP_DIR / "skills"
 AUDIT_SKILL_PATH = os.getenv("AUDIT_AD_SKILL_PATH", "")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini")
 
 DEFAULT_COLUMN_ALIASES = {
     "campaign_name": ["campaign_name", "campaign name", "campaign"],
@@ -50,6 +53,16 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def ensure_table_columns(conn: sqlite3.Connection, table_name: str, columns: dict[str, str]) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    for column_name, ddl in columns.items():
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+
+
 def init_db() -> None:
     ensure_directories()
     with get_connection() as conn:
@@ -70,6 +83,16 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_creative_assets_normalized_name
             ON creative_assets(normalized_name)
             """
+        )
+        ensure_table_columns(
+            conn,
+            "creative_assets",
+            {
+                "analysis_json": "TEXT",
+                "analysis_model": "TEXT",
+                "analyzed_at": "TEXT",
+                "analysis_version": "TEXT",
+            },
         )
 
 
@@ -209,7 +232,8 @@ def list_creatives() -> pd.DataFrame:
     with get_connection() as conn:
         df = pd.read_sql_query(
             """
-            SELECT id, creative_name, normalized_name, media_type, file_path, created_at
+            SELECT id, creative_name, normalized_name, media_type, file_path, created_at,
+                   analysis_model, analyzed_at
             FROM creative_assets
             ORDER BY id DESC
             """,
@@ -489,13 +513,556 @@ def latest_creatives_by_name() -> pd.DataFrame:
                 FROM creative_assets
                 GROUP BY normalized_name
             )
-            SELECT c.id, c.creative_name, c.normalized_name, c.media_type, c.file_path
+            SELECT c.id, c.creative_name, c.normalized_name, c.media_type, c.file_path,
+                   c.analysis_json, c.analysis_model, c.analyzed_at
             FROM creative_assets c
             INNER JOIN latest l ON c.id = l.max_id
             """,
             conn,
         )
     return df
+
+
+def build_metrics_view(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
+    if granularity == "ad":
+        return df.copy()
+
+    if granularity == "campaign":
+        group_keys = ["campaign_name"]
+        agg_spec: dict[str, object] = {
+            "spend": "sum",
+            "impressions": "sum",
+            "clicks": "sum",
+            "installs": "sum",
+        }
+    elif granularity == "adset":
+        group_keys = ["campaign_name", "adset_name"]
+        agg_spec = {
+            "spend": "sum",
+            "impressions": "sum",
+            "clicks": "sum",
+            "installs": "sum",
+        }
+    else:
+        group_keys = ["normalized_name"] if "normalized_name" in df.columns else ["ad_name"]
+        agg_spec = {
+            "ad_name": first_non_empty,
+            "spend": "sum",
+            "impressions": "sum",
+            "clicks": "sum",
+            "installs": "sum",
+        }
+
+    grouped = (
+        df.groupby(group_keys, as_index=False)
+        .agg(agg_spec)
+        .copy()
+    )
+    grouped["ctr"] = safe_divide(grouped["clicks"], grouped["impressions"])
+    grouped["cpm"] = safe_divide(grouped["spend"] * 1000.0, grouped["impressions"])
+    grouped["cti"] = safe_divide(grouped["installs"], grouped["clicks"])
+    grouped["cpi"] = safe_divide(grouped["spend"], grouped["installs"])
+    return grouped
+
+
+def has_any_token(text: str, tokens: Iterable[str]) -> bool:
+    return any(token in text for token in tokens)
+
+
+def infer_creative_features(row: pd.Series) -> dict[str, object]:
+    source_name = str(row.get("creative_name") or row.get("ad_name") or "").strip()
+    normalized = normalize_name(source_name)
+    media_type = str(row.get("media_type") or "").strip().casefold()
+
+    if media_type == "video":
+        creative_format = "video"
+    elif media_type == "image":
+        creative_format = "static"
+    else:
+        creative_format = "unknown"
+
+    has_person = "unknown"
+    person_type = "unknown"
+    if has_any_token(normalized, ["ugc", "creator", "facecam", "selfie", "girl", "boy", "man", "woman", "actor", "talent", "person"]):
+        has_person = "yes"
+        person_type = "ugc_creator" if has_any_token(normalized, ["ugc", "creator", "facecam", "selfie"]) else "actor"
+    elif has_any_token(normalized, ["hand", "hands only", "tay", "camtay"]):
+        has_person = "yes"
+        person_type = "hands_only"
+    elif has_any_token(normalized, ["screen", "ui", "app", "gameplay", "demo"]):
+        has_person = "no"
+
+    hook_first_2s = "unknown"
+    if has_any_token(normalized, ["problem", "pain", "lo lang", "khong ai", "chia tay", "stress"]):
+        hook_first_2s = "pain"
+    elif has_any_token(normalized, ["why", "tai sao", "secret", "shock", "wtf", "bat ngo"]):
+        hook_first_2s = "curiosity"
+    elif has_any_token(normalized, ["benefit", "save", "easy", "nhanh", "relax", "focus", "learn"]):
+        hook_first_2s = "benefit"
+    elif has_any_token(normalized, ["offer", "sale", "discount", "free", "trial", "limited"]):
+        hook_first_2s = "offer"
+    elif has_any_token(normalized, ["review", "testimonial", "rating", "social proof", "viral"]):
+        hook_first_2s = "social_proof"
+
+    shows_product_ui = "yes" if has_any_token(normalized, ["ui", "screen", "record", "demo", "app", "gameplay"]) else "unknown"
+    before_after = "yes" if has_any_token(normalized, ["before after", "beforeafter", "compare", "vs", "transform", "remix"]) else "unknown"
+    voiceover = "yes" if has_any_token(normalized, ["voice", "voiceover", "vo", "narration", "talk"]) else "unknown"
+    social_proof = "yes" if has_any_token(normalized, ["review", "rating", "testimonial", "user", "social proof"]) else "unknown"
+
+    offer_type = "unknown"
+    if has_any_token(normalized, ["free trial", "trial", "dung thu"]):
+        offer_type = "free_trial"
+    elif has_any_token(normalized, ["discount", "sale", "giam gia"]):
+        offer_type = "discount"
+    elif has_any_token(normalized, ["limited", "today only", "fomo"]):
+        offer_type = "limited_time"
+    elif has_any_token(normalized, ["organic"]):
+        offer_type = "none"
+
+    return {
+        "creative_label": source_name or str(row.get("ad_name") or "").strip(),
+        "format": creative_format,
+        "has_person": has_person,
+        "person_type": person_type,
+        "camera_style": "unknown",
+        "hook_first_2s": hook_first_2s,
+        "shows_product_ui": shows_product_ui,
+        "voiceover": voiceover,
+        "before_after": before_after,
+        "primary_claim": "unknown",
+        "claim_specificity": "unknown",
+        "social_proof": social_proof,
+        "offer_type": offer_type,
+        "driver": row.get("win_driver", "unknown"),
+        "audit_status": row.get("audit_status", ""),
+        "inference_source": "asset metadata + naming convention",
+        "confidence": "low",
+        "notes": "",
+    }
+
+
+def build_feature_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, row in df.iterrows():
+        fallback = infer_creative_features(row)
+        rows.append(enrich_feature_from_ai(row, fallback))
+    return pd.DataFrame(rows)
+
+
+def build_qualitative_hypotheses(winner_sheet: pd.DataFrame, comparison_sheet: pd.DataFrame) -> list[str]:
+    if winner_sheet.empty:
+        return []
+
+    features = [
+        "format",
+        "has_person",
+        "person_type",
+        "hook_first_2s",
+        "shows_product_ui",
+        "voiceover",
+        "before_after",
+        "social_proof",
+        "offer_type",
+    ]
+    min_count = 2 if len(winner_sheet) >= 4 else 1
+    insights: list[tuple[float, str]] = []
+
+    for col in features:
+        winner_values = winner_sheet[col].fillna("unknown")
+        compare_values = comparison_sheet[col].fillna("unknown") if not comparison_sheet.empty else pd.Series(dtype="object")
+        for value in sorted(v for v in winner_values.unique().tolist() if v not in {"unknown", "", None}):
+            winner_count = int((winner_values == value).sum())
+            if winner_count < min_count:
+                continue
+            winner_rate = winner_count / max(len(winner_values), 1)
+            compare_rate = float((compare_values == value).mean()) if len(compare_values) > 0 else 0.0
+            lift = winner_rate - compare_rate
+            if lift < 0.20:
+                continue
+            insights.append(
+                (
+                    lift,
+                    f"- **{col} = {value}** xuất hiện {winner_count}/{len(winner_values)} creative winner "
+                    f"so với {compare_rate*100:.0f}% ở nhóm còn lại.",
+                )
+            )
+
+    insights.sort(key=lambda item: item[0], reverse=True)
+    return [text for _, text in insights[:4]]
+
+
+def build_driver_playbook_lines(winner_sheet: pd.DataFrame) -> list[str]:
+    if winner_sheet.empty or "driver" not in winner_sheet.columns:
+        return []
+
+    driver_counts = winner_sheet["driver"].fillna("unknown").value_counts()
+    dominant_driver = driver_counts.index[0] if not driver_counts.empty else "unknown"
+
+    if "high CTR" in dominant_driver:
+        return [
+            "- Giữ nguyên angle đang win nhưng test 2s đầu mạnh hơn: `pain` vs `curiosity` vs `benefit`.",
+            "- Ưu tiên mở đầu có pattern interrupt, pacing nhanh và ít text overlay.",
+            "- Test thêm biến thể thumbnail/opening frame trên cùng concept để scale CTR.",
+        ]
+    if "high CTI" in dominant_driver:
+        return [
+            "- Giữ promise hiện tại nhưng show UI/app sớm hơn để tăng expectation matching.",
+            "- Làm claim cụ thể hơn và thêm social proof nếu phù hợp.",
+            "- Tránh hook quá tò mò nếu làm lệch kỳ vọng sau click.",
+        ]
+    if "low CPM" in dominant_driver:
+        return [
+            "- Giữ nhóm visual đang được phân phối tốt và test thêm variant visual sạch hơn.",
+            "- Giảm text overlay dày, tránh opening frame gây cảm giác spam.",
+            "- Test thêm b-roll hoặc frame đầu khác để giữ CPM thấp khi scale.",
+        ]
+
+    return [
+        "- Giữ lại cấu trúc của winner và test từng biến riêng lẻ để isolate yếu tố thắng.",
+        "- Ưu tiên test 2s đầu, mức độ show UI, và độ rõ của claim.",
+    ]
+
+
+def creative_analysis_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "format": {"type": "string", "enum": ["video", "static", "carousel", "unknown"]},
+            "has_person": {"type": "string", "enum": ["yes", "no", "unknown"]},
+            "person_type": {"type": "string", "enum": ["ugc_creator", "actor", "hands_only", "multiple_people", "unknown"]},
+            "camera_style": {"type": "string", "enum": ["selfie_facecam", "tripod", "screen_record", "mixed", "unknown"]},
+            "shows_product_ui": {"type": "string", "enum": ["yes", "no", "unknown"]},
+            "before_after": {"type": "string", "enum": ["yes", "no", "unknown"]},
+            "demo_clarity": {"type": "string", "enum": ["high", "med", "low", "unknown"]},
+            "text_overlay_density": {"type": "string", "enum": ["low", "med", "high", "unknown"]},
+            "visual_quality": {"type": "string", "enum": ["high", "med", "low", "unknown"]},
+            "branding_early": {"type": "string", "enum": ["yes", "no", "unknown"]},
+            "hook_first_2s": {"type": "string", "enum": ["pain", "curiosity", "benefit", "shock", "social_proof", "offer", "question", "unknown"]},
+            "pattern_interrupt_first_2s": {"type": "string", "enum": ["yes", "no", "unknown"]},
+            "pacing": {"type": "string", "enum": ["fast", "normal", "slow", "unknown"]},
+            "cta_presence": {"type": "string", "enum": ["strong", "soft", "none", "unknown"]},
+            "voiceover": {"type": "string", "enum": ["yes", "no", "unknown"]},
+            "voice_style": {"type": "string", "enum": ["natural_ugc", "narration", "robotic", "unknown"]},
+            "music": {"type": "string", "enum": ["none", "low", "trending", "unknown"]},
+            "audio_clarity": {"type": "string", "enum": ["high", "med", "low", "unknown"]},
+            "primary_claim": {"type": "string", "enum": ["speed", "result", "save_money", "simplify", "health", "productivity", "entertainment", "unknown"]},
+            "claim_specificity": {"type": "string", "enum": ["high", "med", "low", "unknown"]},
+            "social_proof": {"type": "string", "enum": ["yes", "no", "unknown"]},
+            "offer_type": {"type": "string", "enum": ["free_trial", "discount", "limited_time", "none", "unknown"]},
+            "notes": {"type": "string"},
+            "confidence": {"type": "string", "enum": ["high", "med", "low"]},
+        },
+        "required": [
+            "format",
+            "has_person",
+            "person_type",
+            "camera_style",
+            "shows_product_ui",
+            "before_after",
+            "demo_clarity",
+            "text_overlay_density",
+            "visual_quality",
+            "branding_early",
+            "hook_first_2s",
+            "pattern_interrupt_first_2s",
+            "pacing",
+            "cta_presence",
+            "voiceover",
+            "voice_style",
+            "music",
+            "audio_clarity",
+            "primary_claim",
+            "claim_specificity",
+            "social_proof",
+            "offer_type",
+            "notes",
+            "confidence",
+        ],
+    }
+
+
+def get_openai_client():
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("Thiếu package `openai`. Chạy `pip install -r requirements.txt` để bật AI vision.") from exc
+    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def encode_file_to_data_url(path: str | os.PathLike) -> str:
+    mime_type, _ = mimetypes.guess_type(str(path))
+    mime_type = mime_type or "application/octet-stream"
+    with open(path, "rb") as file:
+        encoded = base64.b64encode(file.read()).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def extract_video_keyframes(video_path: str | os.PathLike, target_frames: int = 4) -> list[str]:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError(
+            "Thiếu package `opencv-python-headless`. Chạy `pip install -r requirements.txt` để phân tích video."
+        ) from exc
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError("Không mở được file video để trích frame.")
+
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    sample_points = np.linspace(0.1, 0.9, num=target_frames)
+    frames: list[str] = []
+
+    try:
+        for point in sample_points:
+            if frame_count > 0:
+                frame_index = min(int(frame_count * float(point)), max(frame_count - 1, 0))
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                continue
+            ok, buffer = cv2.imencode(".jpg", frame)
+            if not ok:
+                continue
+            encoded = base64.b64encode(buffer.tobytes()).decode("utf-8")
+            frames.append(f"data:image/jpeg;base64,{encoded}")
+    finally:
+        capture.release()
+
+    if not frames:
+        raise RuntimeError("Không trích được frame nào từ video.")
+    return frames
+
+
+def parse_analysis_json(text: str) -> dict[str, object]:
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("AI response không phải JSON object.")
+    return payload
+
+
+def analyze_asset_with_openai(row: pd.Series, model: str) -> dict[str, object]:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Chưa có `OPENAI_API_KEY` trong môi trường.")
+
+    file_path = row.get("file_path")
+    if not isinstance(file_path, str) or not file_path or not os.path.exists(file_path):
+        raise RuntimeError("Không tìm thấy file creative để phân tích.")
+
+    user_content: list[dict[str, object]] = [
+        {
+            "type": "input_text",
+            "text": (
+                "Hãy tag creative ads này theo taxonomy đã định sẵn. "
+                "Nếu không chắc chắn, bắt buộc dùng `unknown`. "
+                "Trả về JSON đúng schema, không thêm markdown."
+            ),
+        }
+    ]
+
+    media_type = str(row.get("media_type") or "").casefold()
+    if media_type == "video":
+        frame_urls = extract_video_keyframes(file_path)
+        for idx, frame_url in enumerate(frame_urls, start=1):
+            user_content.append({"type": "input_text", "text": f"Frame {idx} từ video."})
+            user_content.append({"type": "input_image", "image_url": frame_url, "detail": "low"})
+    else:
+        user_content.append({"type": "input_image", "image_url": encode_file_to_data_url(file_path), "detail": "high"})
+
+    client = get_openai_client()
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Bạn là chuyên gia phân tích qualitative creative Meta Ads. "
+                            "Hãy gắn tag feature sheet theo taxonomy: "
+                            "format, has_person, person_type, camera_style, shows_product_ui, before_after, "
+                            "demo_clarity, text_overlay_density, visual_quality, branding_early, "
+                            "hook_first_2s, pattern_interrupt_first_2s, pacing, cta_presence, "
+                            "voiceover, voice_style, music, audio_clarity, primary_claim, claim_specificity, "
+                            "social_proof, offer_type, notes, confidence. "
+                            "Không suy đoán quá mức; không chắc thì trả `unknown`."
+                        ),
+                    }
+                ],
+            },
+            {"role": "user", "content": user_content},
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "creative_feature_analysis",
+                "schema": creative_analysis_schema(),
+                "strict": True,
+            }
+        },
+    )
+    return parse_analysis_json(response.output_text)
+
+
+def save_creative_analysis(asset_id: int, analysis: dict[str, object], model: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE creative_assets
+            SET analysis_json = ?, analysis_model = ?, analyzed_at = ?, analysis_version = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(analysis, ensure_ascii=False),
+                model,
+                datetime.utcnow().isoformat(timespec="seconds"),
+                "vision-v1",
+                asset_id,
+            ),
+        )
+
+
+def enrich_feature_from_ai(row: pd.Series, fallback: dict[str, object]) -> dict[str, object]:
+    raw = row.get("analysis_json")
+    if not isinstance(raw, str) or not raw.strip():
+        return fallback
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return fallback
+    if not isinstance(parsed, dict):
+        return fallback
+
+    enriched = fallback.copy()
+    for key, value in parsed.items():
+        if key in enriched or key in {"camera_style", "demo_clarity", "text_overlay_density", "visual_quality", "branding_early", "pattern_interrupt_first_2s", "pacing", "cta_presence", "voice_style", "music", "audio_clarity", "primary_claim", "claim_specificity", "confidence", "notes"}:
+            enriched[key] = value
+    enriched["inference_source"] = f"openai_vision ({row.get('analysis_model') or OPENAI_VISION_MODEL})"
+    return enriched
+
+
+def analyze_creatives_with_ai(asset_df: pd.DataFrame, model: str, force: bool = False) -> tuple[int, int]:
+    unique_assets = asset_df.dropna(subset=["id", "file_path"]).drop_duplicates(subset=["id"]).copy()
+    if not force:
+        unique_assets = unique_assets[
+            unique_assets["analysis_json"].isna() | (unique_assets["analysis_json"].astype(str).str.strip() == "")
+        ].copy()
+
+    analyzed = 0
+    skipped = 0
+    for _, row in unique_assets.iterrows():
+        try:
+            analysis = analyze_asset_with_openai(row, model=model)
+            save_creative_analysis(int(row["id"]), analysis, model=model)
+            analyzed += 1
+        except Exception:
+            skipped += 1
+    return analyzed, skipped
+
+
+def render_qualitative_analysis(merged_df: pd.DataFrame) -> None:
+    st.markdown("#### Qualitative Creative Analysis")
+
+    asset_df = merged_df[merged_df["file_path"].notna()].copy()
+    if "id" in asset_df.columns:
+        asset_df = asset_df.drop_duplicates(subset=["id"]).copy()
+    winner_df = asset_df[asset_df["audit_status"] == "✅ WORK"].copy()
+    comparison_df = asset_df[asset_df["audit_status"] != "✅ WORK"].copy()
+
+    if asset_df.empty:
+        st.info("Chưa có creative asset match với CSV, nên chưa thể phân tích định tính theo skill.")
+        return
+
+    with st.expander("AI Vision Tagging", expanded=False):
+        st.caption("AI sẽ đọc trực tiếp image/video đã match và tự gắn tag cho feature sheet. Video được phân tích qua keyframes.")
+        model_name = st.text_input("Vision model", value=OPENAI_VISION_MODEL, key="vision_model_name")
+        force_reanalyze = st.checkbox("Phân tích lại cả asset đã cache", value=False, key="force_reanalyze_assets")
+        if not os.getenv("OPENAI_API_KEY"):
+            st.info("Chưa thấy `OPENAI_API_KEY`. Set env này rồi bấm phân tích để bật auto-tag bằng vision.")
+        if st.button("Analyze matched creatives with AI", type="primary", disabled=not os.getenv("OPENAI_API_KEY")):
+            with st.spinner("Đang phân tích asset với AI vision..."):
+                analyzed_count, skipped_count = analyze_creatives_with_ai(asset_df, model=model_name, force=force_reanalyze)
+            if analyzed_count:
+                st.success(f"Đã phân tích {analyzed_count} asset. Skip/Error: {skipped_count}.")
+                st.rerun()
+            st.warning(f"Không có asset nào được phân tích thành công. Skip/Error: {skipped_count}.")
+
+    feature_sheet = build_feature_sheet(asset_df).reset_index(drop=True)
+    winner_sheet = build_feature_sheet(winner_df).reset_index(drop=True) if not winner_df.empty else pd.DataFrame()
+    comparison_sheet = build_feature_sheet(comparison_df).reset_index(drop=True) if not comparison_df.empty else pd.DataFrame()
+    ai_tagged_count = int(
+        asset_df["analysis_json"].fillna("").astype(str).str.strip().ne("").dropna().sum()
+    ) if "analysis_json" in asset_df.columns else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Matched Assets", f"{len(asset_df):,}")
+    c2.metric("Winner Assets", f"{len(winner_df):,}")
+    c3.metric("Coverage", f"{(len(asset_df) / max(len(merged_df), 1)) * 100:.0f}%")
+    c4.metric("AI Tagged", f"{ai_tagged_count:,}")
+
+    if winner_sheet.empty:
+        st.info("Đã match asset nhưng chưa có đủ creative được đánh giá `WORK` để rút winning elements.")
+    else:
+        hypotheses = build_qualitative_hypotheses(winner_sheet, comparison_sheet)
+        playbook_lines = build_driver_playbook_lines(winner_sheet)
+        summary_lines = [
+            "- Phần dưới đây là **hypothesis định tính** theo skill, dựa trên asset đã match, `media_type`, naming convention và driver định lượng của nhóm winner.",
+        ]
+        if hypotheses:
+            summary_lines.append("- Yếu tố đang over-index trong nhóm winner:")
+            summary_lines.extend(hypotheses)
+        else:
+            summary_lines.append("- Chưa có đủ tín hiệu naming/feature rõ ràng để chỉ ra một winning element nổi trội.")
+
+        if playbook_lines:
+            summary_lines.append("- Gợi ý test tiếp theo theo driver đang thắng:")
+            summary_lines.extend(playbook_lines)
+
+        st.markdown("\n".join(summary_lines))
+
+    with st.expander("Creative Feature Sheet", expanded=False):
+        display_columns = [
+            "creative_label",
+            "format",
+            "has_person",
+            "person_type",
+            "camera_style",
+            "hook_first_2s",
+            "shows_product_ui",
+            "voiceover",
+            "before_after",
+            "primary_claim",
+            "claim_specificity",
+            "social_proof",
+            "offer_type",
+            "driver",
+            "audit_status",
+            "inference_source",
+            "confidence",
+            "notes",
+        ]
+        feature_sheet_display = feature_sheet.reindex(columns=display_columns, fill_value="unknown").copy()
+        feature_sheet_display.loc[feature_sheet_display["notes"] == "unknown", "notes"] = ""
+        st.dataframe(
+            feature_sheet_display,
+            width="stretch",
+            height=min(120 + 38 * len(feature_sheet), 420),
+            column_config={
+                "creative_label": st.column_config.TextColumn("Creative", width="medium"),
+                "shows_product_ui": st.column_config.TextColumn("Shows UI", width="small"),
+                "hook_first_2s": st.column_config.TextColumn("Hook 2s", width="small"),
+                "before_after": st.column_config.TextColumn("Before/After", width="small"),
+                "primary_claim": st.column_config.TextColumn("Primary Claim", width="small"),
+                "social_proof": st.column_config.TextColumn("Social Proof", width="small"),
+                "audit_status": st.column_config.TextColumn("Đánh giá", width="small"),
+                "inference_source": st.column_config.TextColumn("Inference Source", width="medium"),
+                "notes": st.column_config.TextColumn("Notes", width="large"),
+            },
+        )
 
 
 def calculate_benchmark(df: pd.DataFrame) -> dict[str, float]:
@@ -597,6 +1164,20 @@ def make_gradient_styles(series: pd.Series, low_hex: str = "#DCEBFF", high_hex: 
         text_color = "#0F172A" if luminance > 0.62 else "#F8FAFC"
         styles.append(f"background-color: rgb({r},{g},{b}); color: {text_color};")
     return styles
+
+
+def get_selected_rows(table_state: object) -> list[int]:
+    if table_state is None:
+        return []
+    try:
+        return list(table_state.selection.rows)
+    except Exception:
+        pass
+    try:
+        selection = table_state.get("selection", {})
+        return list(selection.get("rows", []))
+    except Exception:
+        return []
 
 
 def build_skill_thresholds(
@@ -805,108 +1386,6 @@ def render_analysis() -> None:
     ctr_unit_mode = "percent"
     cti_unit_mode = "percent"
 
-    st.caption("Column mapping đang chạy auto. Mở mục Advanced mapping chỉ khi cần chỉnh tay.")
-    with st.expander("Advanced mapping (optional)", expanded=False):
-        optional_columns = ["(none)"] + columns
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            campaign_name_ui = st.selectbox(
-                "Campaign Name (optional)",
-                optional_columns,
-                index=optional_columns.index(campaign_name_col) if campaign_name_col else 0,
-            )
-        with c2:
-            adset_name_ui = st.selectbox(
-                "Adset Name (optional)",
-                optional_columns,
-                index=optional_columns.index(adset_name_col) if adset_name_col else 0,
-            )
-        with c3:
-            ad_name_col = st.selectbox(
-                "Ad Name",
-                columns,
-                index=columns.index(ad_name_col) if ad_name_col else 0,
-            )
-        with c4:
-            spend_col = st.selectbox(
-                "Spend",
-                columns,
-                index=columns.index(spend_col) if spend_col else 0,
-            )
-
-        c5, c6, c7 = st.columns(3)
-        with c5:
-            impressions_col = st.selectbox(
-                "Impressions",
-                columns,
-                index=columns.index(impressions_col) if impressions_col else 0,
-            )
-        with c6:
-            clicks_ui = st.selectbox(
-                "Clicks (optional)",
-                optional_columns,
-                index=optional_columns.index(clicks_col) if clicks_col else 0,
-            )
-        with c7:
-            installs_ui = st.selectbox(
-                "Installs (optional)",
-                optional_columns,
-                index=optional_columns.index(installs_col) if installs_col else 0,
-            )
-
-        c8, c9, c10, c11 = st.columns(4)
-        with c8:
-            cpm_ui = st.selectbox(
-                "CPM (optional, from CSV)",
-                optional_columns,
-                index=optional_columns.index(cpm_col) if cpm_col else 0,
-            )
-        with c9:
-            ctr_ui = st.selectbox(
-                "CTR (optional, from CSV)",
-                optional_columns,
-                index=optional_columns.index(ctr_col) if ctr_col else 0,
-            )
-        with c10:
-            cti_ui = st.selectbox(
-                "CTI (optional, from CSV)",
-                optional_columns,
-                index=optional_columns.index(cti_col) if cti_col else 0,
-            )
-        with c11:
-            cpi_ui = st.selectbox(
-                "CPI (optional, from CSV)",
-                optional_columns,
-                index=optional_columns.index(cpi_col) if cpi_col else 0,
-            )
-
-        rate_mode_labels = [
-            "Auto",
-            "Percent (0.73 = 0.73%)",
-            "Ratio (0.0073 = 0.73%)",
-        ]
-        mode_label_to_value = {
-            "Auto": "auto",
-            "Percent (0.73 = 0.73%)": "percent",
-            "Ratio (0.0073 = 0.73%)": "ratio",
-        }
-        r1, r2 = st.columns(2)
-        with r1:
-            ctr_mode_label = st.selectbox("CTR unit mode", rate_mode_labels, index=1)
-        with r2:
-            cti_mode_label = st.selectbox("CTI unit mode", rate_mode_labels, index=1)
-
-        campaign_name_col = None if campaign_name_ui == "(none)" else campaign_name_ui
-        adset_name_col = None if adset_name_ui == "(none)" else adset_name_ui
-        clicks_col = None if clicks_ui == "(none)" else clicks_ui
-        installs_col = None if installs_ui == "(none)" else installs_ui
-        cpm_col = None if cpm_ui == "(none)" else cpm_ui
-        ctr_col = None if ctr_ui == "(none)" else ctr_ui
-        cti_col = None if cti_ui == "(none)" else cti_ui
-        cpi_col = None if cpi_ui == "(none)" else cpi_ui
-        ctr_unit_mode = mode_label_to_value[ctr_mode_label]
-        cti_unit_mode = mode_label_to_value[cti_mode_label]
-
     used_mapping_cols = {
         ad_name_col,
         spend_col,
@@ -969,9 +1448,7 @@ def render_analysis() -> None:
 
     st.markdown("#### Audit Skill Settings")
     skill_text, skill_path = load_audit_skill_text()
-    if skill_text:
-        st.caption(f"Đang áp dụng rubric từ skill: `{skill_path}`")
-    else:
+    if not skill_text:
         st.warning(f"Không đọc được skill file tại `{skill_path}`. Tool sẽ dùng logic fallback.")
 
     s1, s2, s3 = st.columns(3)
@@ -1022,37 +1499,102 @@ def render_analysis() -> None:
     b1, b2, b3, b4, b5, b6 = st.columns(6)
     b1.metric("Creatives Tested", f"{creative_tested_count:,}")
     b2.metric("Total Test Spend", f"${format_number(total_test_spend, 2)}")
-    b3.metric("Benchmark CPI", format_number(benchmark["cpi"], 2))
-    b4.metric("Benchmark CPM", format_number(benchmark["cpm"], 2))
-    b5.metric("Benchmark CTR", format_percent(benchmark["ctr"]))
-    b6.metric("Benchmark CTI", format_percent(benchmark["cti"]))
+    b3.metric("Overall CPI", format_number(benchmark["cpi"], 2))
+    b4.metric("Overall CPM", format_number(benchmark["cpm"], 2))
+    b5.metric("Overall CTR", format_percent(benchmark["ctr"]))
+    b6.metric("Overall CTI", format_percent(benchmark["cti"]))
     st.caption(
         f"Audit thresholds -> CPI tốt <= ${format_number(thresholds['cpi_good'],2)}, "
         f"CPI kém > ${format_number(thresholds['cpi_bad'],2)}, "
         f"min spend ${format_number(thresholds['min_spend'],2)}"
     )
 
-    table_columns = [
-        "campaign_name",
-        "adset_name",
-        "ad_name",
-        "audit_status",
-        "audit_action",
-        "spend",
-        "installs",
-        "cpi",
-        "cpm",
-        "ctr",
-        "cti",
-    ]
-    table_columns.extend([col for col in extra_table_cols if col in merged_df.columns and col not in table_columns])
-    table_df = merged_df[table_columns].copy()
+    st.markdown("#### Metrics Table")
+    table_granularity = st.selectbox(
+        "Group metrics by",
+        options=["campaign", "adset", "ad", "ads only"],
+        index=2,
+    )
+
+    table_view_df = build_metrics_view(merged_df, table_granularity)
+    table_benchmark = calculate_benchmark(table_view_df)
+    table_view_df["win_driver"] = table_view_df.apply(classify_driver, axis=1, benchmark=table_benchmark)
+    table_thresholds = build_skill_thresholds(
+        table_view_df,
+        use_manual=use_manual_benchmark,
+        cpi_good_input=cpi_good_input,
+        cpi_bad_input=cpi_bad_input,
+        min_spend_for_decision=min_spend_for_decision,
+    )
+    table_skill_eval = table_view_df.apply(
+        lambda row: evaluate_with_audit_skill(row, table_thresholds),
+        axis=1,
+        result_type="expand",
+    )
+    table_skill_eval.columns = ["audit_status", "audit_action"]
+    table_view_df = pd.concat([table_view_df, table_skill_eval], axis=1)
+    table_view_df = table_view_df.sort_values(["cpi", "installs"], ascending=[True, False], na_position="last")
+
+    if table_granularity == "campaign":
+        table_columns = [
+            "campaign_name",
+            "spend",
+            "installs",
+            "cpi",
+            "cpm",
+            "ctr",
+            "cti",
+            "audit_status",
+            "audit_action",
+        ]
+    elif table_granularity == "adset":
+        table_columns = [
+            "campaign_name",
+            "adset_name",
+            "spend",
+            "installs",
+            "cpi",
+            "cpm",
+            "ctr",
+            "cti",
+            "audit_status",
+            "audit_action",
+        ]
+    elif table_granularity == "ads only":
+        table_columns = [
+            "ad_name",
+            "spend",
+            "installs",
+            "cpi",
+            "cpm",
+            "ctr",
+            "cti",
+            "audit_status",
+            "audit_action",
+        ]
+    else:
+        table_columns = [
+            "campaign_name",
+            "adset_name",
+            "ad_name",
+            "spend",
+            "installs",
+            "cpi",
+            "cpm",
+            "ctr",
+            "cti",
+            "audit_status",
+            "audit_action",
+        ]
+        table_columns.extend([col for col in extra_table_cols if col in table_view_df.columns and col not in table_columns])
+
+    table_df = table_view_df[table_columns].copy()
     table_df = table_df.rename(columns={"spend": "cost"})
+    table_df = table_df.loc[:, ~table_df.columns.duplicated()].copy()
+    table_df = table_df.reset_index(drop=True)
     table_df["ctr"] = table_df["ctr"] * 100
     table_df["cti"] = table_df["cti"] * 100
 
-    st.markdown("#### Metrics Table")
-    st.caption("Các cột tên dài đã set độ rộng lớn hơn. Bạn có thể kéo cạnh cột để resize thủ công.")
     styled_table_df = (
         table_df.style.format(
             {
@@ -1065,87 +1607,82 @@ def render_analysis() -> None:
             na_rep="-",
         )
         .apply(make_gradient_styles, subset=["cpi"])
+        .apply(make_gradient_styles, subset=["cpm"], low_hex="#FEE2E2", high_hex="#B91C1C")
         .apply(make_gradient_styles, subset=["ctr"])
         .apply(make_gradient_styles, subset=["cti"])
     )
-    st.dataframe(
+    table_state = st.dataframe(
         styled_table_df,
         width="stretch",
         height=460,
+        on_select="rerun",
+        selection_mode="multi-row",
+        key=f"metrics_table_{table_granularity}",
         column_config={
             "campaign_name": st.column_config.TextColumn("Campaign Name", width="medium"),
             "adset_name": st.column_config.TextColumn("Adset Name", width="medium"),
             "ad_name": st.column_config.TextColumn("Ad Name", width="medium"),
-            "audit_status": st.column_config.TextColumn("Đánh giá tổng", width="medium"),
-            "audit_action": st.column_config.TextColumn("Khuyến nghị", width="medium"),
             "cost": st.column_config.NumberColumn("Cost", format="$%.2f"),
             "installs": st.column_config.NumberColumn("Install", format="%d"),
-            "cpm": st.column_config.NumberColumn("CPM", format="$%.2f"),
             "cpi": st.column_config.NumberColumn("CPI", format="$%.2f"),
+            "cpm": st.column_config.NumberColumn("CPM", format="$%.2f"),
             "ctr": st.column_config.NumberColumn("CTR", format="%.2f%%"),
             "cti": st.column_config.NumberColumn("CTI", format="%.2f%%"),
+            "audit_status": st.column_config.TextColumn("Đánh giá tổng", width="medium"),
+            "audit_action": st.column_config.TextColumn("Khuyến nghị", width="medium"),
         },
     )
 
-    with st.expander("Debug CTR/CTI calculations", expanded=False):
-        debug_df = merged_df[
-            [
-                "campaign_name",
-                "adset_name",
-                "ad_name",
-                "impressions",
-                "clicks",
-                "installs",
-                "ctr",
-                "cti",
-            ]
-        ].copy()
-        debug_df["ctr_pct"] = debug_df["ctr"] * 100
-        debug_df["cti_pct"] = debug_df["cti"] * 100
-        st.dataframe(
-            debug_df[
-                [
-                    "campaign_name",
-                    "adset_name",
-                    "ad_name",
-                    "impressions",
-                    "clicks",
-                    "installs",
-                    "ctr_pct",
-                    "cti_pct",
-                ]
-            ],
-            width="stretch",
-            height=260,
-            column_config={
-                "ctr_pct": st.column_config.NumberColumn("CTR (%)", format="%.2f"),
-                "cti_pct": st.column_config.NumberColumn("CTI (%)", format="%.2f"),
-            },
-        )
-        st.caption("CTR = clicks / impressions * 100; CTI = installs / clicks * 100")
-
-    unmatched = merged_df[merged_df["file_path"].isna()]["ad_name"].drop_duplicates().tolist()
-    if unmatched:
-        st.warning(f"{len(unmatched)} ads do not have matched creative in library.")
-        with st.expander("View unmatched ad names"):
-            st.write(unmatched)
+    selected_rows = get_selected_rows(table_state)
+    if selected_rows:
+        selected_compare_df = table_df.iloc[selected_rows].reset_index(drop=True)
+        with st.expander(f"Selected Comparison ({len(selected_compare_df)})", expanded=False):
+            st.dataframe(
+                selected_compare_df,
+                width="stretch",
+                height=min(120 + 38 * len(selected_compare_df), 420),
+                column_config={
+                    "campaign_name": st.column_config.TextColumn("Campaign Name", width="medium"),
+                    "adset_name": st.column_config.TextColumn("Adset Name", width="medium"),
+                    "ad_name": st.column_config.TextColumn("Ad Name", width="medium"),
+                    "cost": st.column_config.NumberColumn("Cost", format="$%.2f"),
+                    "installs": st.column_config.NumberColumn("Install", format="%d"),
+                    "cpi": st.column_config.NumberColumn("CPI", format="$%.2f"),
+                    "cpm": st.column_config.NumberColumn("CPM", format="$%.2f"),
+                    "ctr": st.column_config.NumberColumn("CTR", format="%.2f%%"),
+                    "cti": st.column_config.NumberColumn("CTI", format="%.2f%%"),
+                    "audit_status": st.column_config.TextColumn("Đánh giá tổng", width="medium"),
+                    "audit_action": st.column_config.TextColumn("Khuyến nghị", width="medium"),
+                },
+            )
 
     st.markdown("#### AI Conclusion")
     st.markdown(build_ai_conclusion(merged_df, benchmark))
 
     st.markdown("#### Creative Preview")
-    preview_mode = st.radio(
+    preview_mode = st.selectbox(
         "Preview mode",
-        options=["Top winners by CPI", "Top spend rows"],
-        horizontal=True,
+        options=[
+            "Top winners by CPI",
+            "Top winners by CTR",
+            "Top winners by CTI",
+            "Top winners by CPM (Thấp là tốt hơn)",
+        ],
     )
-    cards_per_row = st.slider("Cards per row", min_value=2, max_value=6, value=4)
+    cards_per_row = st.select_slider("Cards per row", options=[2, 4, 6, 8, 10, 12, 14], value=6)
+    preview_source_df = merged_df[merged_df["audit_status"] != "⏳ CHỜ THÊM DATA"].copy()
     if preview_mode == "Top winners by CPI":
-        preview_df = merged_df.sort_values("cpi", ascending=True).head(preview_limit)
+        preview_df = preview_source_df.sort_values("cpi", ascending=True).head(preview_limit)
+    elif preview_mode == "Top winners by CTR":
+        preview_df = preview_source_df.sort_values("ctr", ascending=False).head(preview_limit)
+    elif preview_mode == "Top winners by CTI":
+        preview_df = preview_source_df.sort_values("cti", ascending=False).head(preview_limit)
     else:
-        preview_df = merged_df.sort_values("spend", ascending=False).head(preview_limit)
+        preview_df = preview_source_df.sort_values("cpm", ascending=True).head(preview_limit)
 
     preview_df = preview_df.reset_index(drop=True)
+    if preview_df.empty:
+        st.info("Không có creative đủ data để hiển thị trong Creative Preview.")
     for start_idx in range(0, len(preview_df), cards_per_row):
         row_cols = st.columns(cards_per_row)
         chunk = preview_df.iloc[start_idx : start_idx + cards_per_row]
@@ -1160,12 +1697,14 @@ def render_analysis() -> None:
                     st.caption(f"CTR {format_percent(row['ctr'])} | CTI {format_percent(row['cti'])}")
                     st.caption(f"{row['audit_status']} | {row['audit_action']} | {row['win_driver']}")
 
+    render_qualitative_analysis(merged_df)
+
 
 def main() -> None:
     st.set_page_config(page_title="Meta Ad Analyzer", layout="wide")
     init_db()
 
-    st.title("Meta Ad Creative Analyzer (MVP)")
+    st.title("Meta Ad Creative Analyzer")
     st.write(
         "Upload creative assets once, then upload CSV metrics to detect winning ads and why they win "
         "based on CPI/CPM/CTR/CTI."
