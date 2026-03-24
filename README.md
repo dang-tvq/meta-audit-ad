@@ -114,8 +114,9 @@ The app will:
 ## Render Deploy
 
 - Blueprint file: `render.yaml`
-- This deploy config mounts a persistent disk and points app data to:
-  - `/var/data/meta-ad-analyzer`
+- Current Render config is **stateless**:
+  - app data is written to `/tmp/meta-ad-analyzer`
+  - uploads / SQLite data are lost after restart or redeploy
 - Start command on Render:
   - `streamlit run app.py --server.port $PORT --server.address 0.0.0.0`
 
